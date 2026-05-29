@@ -1,100 +1,244 @@
-# AI-CMS
+# AI-CMS — a website you run by talking to an AI
 
-ИИ-платформа управления сайтами — замена традиционной CMS. Нетехнический клиент ведёт свой
-сайт, **разговаривая с ИИ-агентом обычным языком**: правки появляются в живом превью, публикация и
-откат — одной фразой. Синтез двух проектов: *Siberian Motorbears* (статика + ИИ вместо CMS) и
-*kv12chat* (BaaS+PWA). Полный план: [`~/.claude/plans/rosy-finding-treehouse.md`](file:///home/trigan-d/.claude/plans/rosy-finding-treehouse.md).
+> A replacement for the traditional CMS: a non-technical client builds and runs their
+> small website just by **talking** (text or voice) to an AI agent. No admin panels,
+> themes, plugins or block builders — only a conversation and a live preview.
 
-## MVP — что это
+🇷🇺 Русская версия: [docs/hackathon/ai-cms/README.ru.md](docs/hackathon/ai-cms/README.ru.md)
 
-«Siberian Motorbears как SaaS»: мультитенантный хостинг **статики** + поддомены «в один клик» +
-редактирование через чат с **self-hosted** кодовой моделью. Ключевые решения:
+---
 
-- **Свободный код, без палитры.** ИИ правит произвольные HTML/CSS/JS + картинки — никакого
-  фиксированного набора компонентов/тем.
-- **Версии/undo/publish = git** на каждого тенанта. Рантайм = отдача статики.
-- **LLM — готовая open-модель** с tool-calling (ориентир Qwen2.5-Coder), сервинг через любой
-  **OpenAI-совместимый** эндпоинт (vLLM в проде, Ollama для разработки). Без дообучения в MVP.
+## TL;DR
 
-Динамика (комментарии/отзывы/формы/магазин), PWA, голос, своя дообученная модель — в роадмапе.
+For a huge class of small sites (business cards, landing pages, small-business sites,
+blogs) you don't need a CMS with a palette of prefab blocks. It's enough to give the
+client a **chat with an AI** that edits the site from a plain-language description, shows
+changes in real time, and publishes on a "ship it" command. The platform is multi-tenant:
+each client gets a site on a 3rd-level subdomain (`mysite.platform.ru`) in one click, with
+automatic HTTPS.
 
-## Что уже реализовано
+It's a synthesis of two ideas proven on real projects:
+- **Siberian Motorbears** — a site is just a folder of static files, and the "CMS" is an
+  AI agent in the console that edits the code from requests in your native language.
+- **kv12chat** — you don't need to write a typical backend: a BaaS (Supabase) covers it,
+  and a PWA replaces native apps; all self-hosted, vendor-neutral, works in Russia.
 
-Ядро агентного цикла редактирования (фазы 0–1 плана), запускаемое из CLI:
+---
+
+## 1. What makes the approach different
+
+In a normal CMS the client assembles a page from prefab blocks and hits their ceiling.
+Here there is **no fixed palette**: the AI edits arbitrary code (any HTML/CSS/JS + images).
+"Make the background dark", "add a Contacts page and a menu item", "make the heading
+bigger", "lay the price list out in three columns" — the agent writes the markup the task
+needs, instead of bending it to fit someone's plugin.
+
+Meanwhile the hard parts that a CMS bakes into its admin panel are here handled by
+infrastructure:
+- **versions, undo, "put it back"** — that's git, per tenant;
+- **publishing** — an atomic copy into the served folder;
+- **subdomains, HTTPS, multi-tenancy** — Caddy + Supabase + middleware.
+
+---
+
+## 2. Architecture
 
 ```
-packages/agent-core/      Провайдер-нейтральное ядро
-  src/provider.ts         OpenAICompatibleProvider (vLLM/Ollama/хостед, из ENV)
-  src/sandbox.ts          Изоляция файловых операций корнем тенанта (anti-traversal)
-  src/git.ts              Тонкая обёртка над git CLI
-  src/tenant-repo.ts      Сайт тенанта как git: draft ↔ published, publish/revert/rollback
-  src/tools.ts            Инструменты модели: fs_list/read/write/edit, list_history, publish, revert
-  src/loop.ts             Tool-calling цикл (один пользовательский ход до ответа)
-  src/prompt.ts           Системный промпт (свободный код, publish только по подтверждению)
-apps/cli/                 Локальный драйвер
-  src/chat.ts             Интерактивный чат-редактор против scratch-тенанта
-  src/spike.ts            Фаза-0 спайк: гоняет SM-style запросы, считает % успешных правок
-eval/tasks.json           ~10 реальных SM-style запросов с проверками
-templates/starter/        Стартовый статический сайт (шапка/меню/hero/секции/подвал)
+                *.platform.ru   (wildcard DNS + wildcard TLS)
+                          │ 443
+                    ┌─────▼─────┐  ← the only public entrypoint
+                    │   CADDY   │  TLS, security headers
+                    └──┬─────┬──┘
+   platform.ru / app   │     │ *.platform.ru (tenant sites) · api.platform.ru
+              ┌─────────▼─┐ ┌─▼──── KONG ───────────────┐
+              │  STUDIO   │ │ GoTrue · PostgREST · ...   │  (Supabase)
+              │ Next.js16 │ └──────────────┬────────────┘
+              │ chat+prev │                │
+              │ proxy.ts  │         ┌──────▼──────┐
+              └──┬─────┬──┘         │  POSTGRES   │ ← all tenants, isolation = RLS
+                 │     │            │  + RLS      │
+          ┌──────▼─┐ ┌─▼────────┐   └─────────────┘
+          │ OLLAMA │ │ (kong)   │
+          │  LLM   │ └──────────┘
+          └────────┘
+   A tenant's site = a git repo: draft (agent edits) ↔ published (served).
 ```
 
-Покрыто тестами (без LLM): изоляция sandbox, инициализация git, publish (копирование дерева без
-`.git`), `fs_edit` на неуникальную строку, блокировка traversal, `revertDraft`, `rollbackTo`.
+**Stack:** Next.js 16 (App Router, RSC, TypeScript strict), self-hosted Supabase
+(Postgres + GoTrue + PostgREST + Realtime + Storage + RLS), Ollama for the self-hosted
+LLM, Caddy (TLS/routing), all in Docker Compose. Services are reached only via ENV, so the
+same code runs locally, in the cloud, and on your own VPS in Russia (vendor-neutral).
 
-## Быстрый старт
+---
 
-### 1. Поднять модель (один из вариантов)
+## 3. How editing works (the heart of the project)
 
-**Ollama** (проще всего для разработки, CPU/слабый GPU):
+It's "Claude Code / Cursor for one client's static folder", but on a self-hosted model:
+
+1. The client types (or speaks) a request into the chat.
+2. The agent loops, calling tools: `fs_list`, `fs_read`, `fs_write`, `fs_edit`,
+   `publish`, `revert`. File operations are **locked to the tenant's root** (a sandbox,
+   traversal-proof) — one client's agent physically can't see another's files.
+3. So the agent doesn't have to guess the structure, the **current site state** is put
+   into its system prompt (`buildSiteContext`) — this sharply raises edit accuracy.
+4. Changes go into a **draft** and appear instantly in the live preview.
+5. "Ship it" → atomic publish (commit + copy into the served folder).
+   "Undo" / "put it back" → rollback via git.
+
+**How it's implemented (git under the hood).** Every site is a real git repository; a tenant
+has two folders: `data/tenants/<id>/` — the working tree the agent edits (the **draft**, also
+what the preview shows), and `data/sites/<subdomain>/` — the published copy (what the server
+serves). Mapping to git: creating a site = `git init` + the first commit; "Publish" =
+`git commit` (**a new version**) + an atomic copy into the served folder; "Discard draft" =
+`git checkout`/`clean`; "put it back" = a forward `git revert` (history is preserved); the
+version list = `git log`. No custom "versioning system" had to be written — git covers that
+role, and the content lives as plain files. Postgres holds only the control plane (owner,
+subdomain, status), not site content.
+
+**The LLM is self-hosted.** A ready open model with tool-calling is used; the default is
+`llama3.1:8b` (reliably completes multi-step edits — create a page *and* add the menu
+link). The provider is abstracted (OpenAI-compatible endpoint: Ollama/vLLM or hosted), so
+the model can be swapped or fine-tuned for the task.
+
+---
+
+## 4. Multi-tenancy and dynamics without backend code
+
+- **One Supabase instance, isolation via `tenant_id` + RLS** (not "a project per client").
+  An owner sees and edits only their own sites — guaranteed by the database, not by some
+  controller check.
+- **Subdomain in one click**: a row in `tenants` + initializing a git repo from a
+  template. Wildcard DNS and wildcard TLS already cover everyone — DNS/Caddy aren't touched.
+- **Authentication** — GoTrue (email+password), cookie sessions via `@supabase/ssr`
+  (the kv12chat pattern). Clients self-register.
+
+---
+
+## 5. Features (implemented)
+
+- **AI editor**: chat + live draft preview + "Publish" / "Discard draft".
+- **Free-form code**: any HTML/CSS/JS, multi-page sites with navigation.
+- **Multi-tenancy**: owner's site dashboard, subdomain provisioning, RLS isolation.
+- **Subdomain serving**: `name.platform.ru` serves the published site with auto-HTTPS.
+- **Voice (R3)**: a mic button — locally via the browser's Web Speech API, in production
+  via self-hosted Whisper (`/api/stt`, OpenAI-compatible).
+- **Custom domains (R5)**: a client attaches their own domain (`www.shop.com`); Caddy
+  issues a cert on-demand only for verified domains (`/api/tls/allowed`).
+- **Hardening**: security headers/CSP on served sites, host-only cookies (the owner's
+  session never leaks to tenant sites), sandboxed file operations.
+- **Infrastructure**: Docker Compose (Supabase + Studio + Ollama + Caddy), CI-less deploy
+  (`deploy.sh`: git pull → migrations → rebuild → up), vendor-neutral.
+
+---
+
+## 6. Repository layout
+
+```
+packages/agent-core/      Provider-neutral editing core
+  src/provider.ts         OpenAICompatibleProvider (vLLM/Ollama/hosted, from ENV)
+  src/sandbox.ts          File ops locked to the tenant root (anti-traversal)
+  src/git.ts              Thin wrapper over the git CLI
+  src/tenant-repo.ts      A tenant's site as git: draft ↔ published, publish/revert/rollback
+  src/tools.ts            Model tools: fs_list/read/write/edit, list_history, publish, revert
+  src/loop.ts             Tool-calling loop (one user turn until a reply)
+  src/prompt.ts           System prompt (free-form code, publish only on confirmation)
+  src/context.ts          buildSiteContext — current site state into the prompt
+apps/cli/                 Local driver
+  src/chat.ts             Interactive chat editor against a scratch tenant
+  src/spike.ts            Phase-0 spike: runs SM-style requests, scores % of clean edits
+apps/studio/              Next.js 16 multi-tenant studio (auth, dashboard, editor, serving)
+supabase/                 Control plane: config.toml (ports 553xx), migrations (profiles, tenants, RLS)
+infra/                    Self-host: Dockerfile, Caddyfile (wildcard TLS), docker-compose, deploy.sh
+templates/starter/        Multi-page starter site (index + about)
+eval/tasks.json           ~10 real SM-style requests with checks
+```
+
+---
+
+## 7. Run it locally
+
+### Option A — full Studio (multi-tenant)
+
 ```bash
-ollama serve
-ollama pull qwen2.5-coder:14b      # или :7b на слабой машине
-```
-
-**vLLM** (прод, GPU; OpenAI-совместимый эндпоинт на :8001):
-```bash
-vllm serve Qwen/Qwen2.5-Coder-32B-Instruct-AWQ --port 8001
-```
-
-### 2. Настроить окружение
-```bash
-cp .env.example .env
-# отредактируйте LLM_BASE_URL / LLM_MODEL под вашу модель
+# 1. Model: Ollama + a model
+ollama serve && ollama pull llama3.1:8b
+# 2. Control plane: Supabase (ports 553xx)
+supabase start
+# 3. Studio
 pnpm install
+pnpm --filter @ai-cms/studio dev        # → http://localhost:3000
+# Published sites are at http://<subdomain>.localhost:3000
 ```
 
-### 3. Запустить чат-редактор
+### Option B — single-tenant CLI editor
+
 ```bash
-pnpm chat
-# you › сделай фон тёмным и добавь в меню пункт «Контакты»
-# you › заливай            (публикует draft)
-# you › верни как было     (откат)
-# команды: /files /log /reset /exit
-```
-Тенант создаётся из `templates/starter` в `./data/tenants/cli-demo`, публикуется в
-`./data/sites/cli-demo`.
+# 1. Bring up a model (one of the two)
+ollama serve && ollama pull llama3.1:8b          # dev: CPU / weak GPU
+# vllm serve Qwen/Qwen2.5-Coder-32B-Instruct-AWQ --port 8001   # prod: GPU
 
-### 4. Прогнать спайк (гейт фазы 0 — оценить готовую модель)
+# 2. Configure the environment
+cp .env.example .env                             # edit LLM_BASE_URL / LLM_MODEL
+pnpm install
+
+# 3. Run the chat editor
+pnpm chat
+# you › make the background dark and add a "Contacts" item to the menu
+# you › ship it          (publishes the draft)
+# you › put it back      (rollback)
+# commands: /files /log /reset /exit
+```
+
+The tenant is created from `templates/starter` in `./data/tenants/cli-demo` and published
+to `./data/sites/cli-demo`.
+
+### Phase-0 spike (evaluate the ready model)
+
 ```bash
 pnpm spike
 ```
-Для каждого запроса создаётся свежий тенант, делается один ход агента, проверяются файлы и печатается
-diff. В конце — доля авто-успешных правок. Это и есть проверка «годится ли готовая модель для
-свободного редактирования статики».
 
-## Команды
+For each request a fresh tenant is created, one agent turn runs, files are checked and a
+diff is printed. At the end — the share of auto-successful edits. This is the check for
+"is a ready-made model good enough for free-form static editing".
 
-| Команда | Действие |
+---
+
+## 8. Commands
+
+| Command | What it does |
 |---|---|
-| `pnpm install` | Установить зависимости воркспейса |
-| `pnpm chat` | Интерактивный чат-редактор |
-| `pnpm spike` | Спайк-харнес (оценка модели на SM-style правках) |
-| `pnpm -r typecheck` | Типизация всех пакетов |
-| `pnpm -r test` | Тесты (agent-core) |
+| `pnpm install` | Install workspace dependencies |
+| `pnpm chat` | Interactive chat editor (single tenant) |
+| `pnpm spike` | Spike harness (model evaluation on SM-style edits) |
+| `pnpm --filter @ai-cms/studio dev` | Run the Studio (→ localhost:3000) |
+| `supabase start` | Bring up the control plane (ports 553xx) |
+| `pnpm -r typecheck` | Type-check all packages |
+| `pnpm -r test` | Tests (agent-core; `node:test` + `tsx`) |
 
-## Дальше по плану
+> ⚠️ After changing `agent-core`, rebuild it: `pnpm --filter @ai-cms/agent-core build`.
 
-Studio-UI (Next.js: чат + iframe-превью + publish/undo + авторизация) → мультитенантность
-(control-DB, резолв поддоменов, провижининг «в один клик») → инфра self-host (Caddy wildcard
-TLS, docker-compose, deploy.sh) → хардненинг свободного кода (CSP, изоляция origin). Затем роадмап:
-динамика/BaaS, PWA, голос, своя дообученная модель.
+---
+
+## 9. Next steps
+
+- **Dynamics / BaaS (R1):** a blog with comments, reviews, forms — tables with `tenant_id`
+  and RLS (the pattern is already in place); anonymous writes through a thin server proxy
+  with anti-spam; the seam with the markup via platform web components
+  (`<aicms-comments>`) so the freedom of layout is preserved. Then an online store
+  (products, cart, orders).
+- **Per-tenant PWA (R2):** auto manifest/service-worker/icon and installing the client's
+  site onto a visitor's phone (the code scaffold exists).
+- **Own fine-tuned model (R4):** a dataset from real editing sessions
+  (input: files+request, output: applied edits) → fine-tune a small model (QLoRA) →
+  switch inference over, with the ready/hosted model as fallback. Goal — cost control and
+  working in Russia.
+- **Production deploy**: a VPS in Russia, wildcard DNS, Caddy with the provider's DNS
+  plugin; a GPU for inference to make edits fast.
+- **Business model**: a subscription for "a website you run by voice"; the agency's
+  marginal cost is near zero — own LLM, own static hosting, own deploy.
+
+---
+
+Details and status — in [`docs/STATUS.md`](docs/STATUS.md), the full plan in
+[`docs/PLAN.md`](docs/PLAN.md), and project context in [`CLAUDE.md`](CLAUDE.md).
