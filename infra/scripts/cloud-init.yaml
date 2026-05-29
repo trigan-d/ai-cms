@@ -1,0 +1,101 @@
+#cloud-config
+# Selectel cloud-init for ai-cms production VPS.
+# Replace __SSH_PUBLIC_KEY__ before submitting.
+# Tested on Ubuntu 24.04 LTS.
+
+hostname: ai-cms
+fqdn: platform.ru
+timezone: Europe/Moscow
+manage_etc_hosts: true
+
+users:
+  - name: deploy
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo, docker]
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __SSH_PUBLIC_KEY__
+
+ssh_pwauth: false
+disable_root: true
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - jq
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - htop
+  - vim
+  - python3
+  - openssl
+
+write_files:
+  - path: /etc/sysctl.d/99-ai-cms.conf
+    content: |
+      vm.swappiness = 10
+      fs.file-max = 200000
+      net.core.somaxconn = 1024
+      net.ipv4.tcp_fin_timeout = 30
+      net.ipv4.tcp_max_syn_backlog = 2048
+
+  - path: /etc/ssh/sshd_config.d/99-ai-cms.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+      MaxAuthTries 3
+      ClientAliveInterval 60
+      ClientAliveCountMax 3
+
+  - path: /etc/fail2ban/jail.d/sshd.local
+    content: |
+      [sshd]
+      enabled = true
+      maxretry = 5
+      bantime = 1h
+
+runcmd:
+  # Docker repo + engine
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - bash -c 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list'
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - usermod -aG docker deploy
+
+  # Firewall
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+
+  # Swap 2 GB (4 GB RAM — страховка от OOM при docker build + Realtime peaks)
+  - fallocate -l 2G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - bash -c 'echo "/swapfile none swap sw 0 0" >> /etc/fstab'
+
+  # Unattended upgrades
+  - DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -plow unattended-upgrades
+
+  # Apply sysctl + restart sshd + fail2ban
+  - sysctl --system
+  - systemctl restart ssh
+  - systemctl enable --now fail2ban
+
+power_state:
+  mode: reboot
+  delay: 1
+  message: "cloud-init complete — rebooting for kernel/swap/sshd"
+  condition: True

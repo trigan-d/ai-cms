@@ -1,0 +1,297 @@
+# Self-hosted Supabase + Next.js + Caddy for ai-cms.
+# Image tags & service env synced with upstream supabase/docker on 2026-05-26.
+# https://github.com/supabase/supabase/tree/master/docker
+#
+# Postgres pinned to 15 (upstream-tested). Local dev config.toml is 17 — our
+# migrations are vanilla SQL, должны лечь на оба. Если что — поменять тэг на
+# 17.x.x.x и пересоздать db volume.
+
+name: ai-cms
+
+# Ротация json-file логов: по умолчанию Docker пишет их без лимита, и за пару
+# месяцев они спокойно отъедают несколько Гб на VPS. 10 МБ × 3 файла на сервис
+# = ≤ 30 МБ × 9 сервисов ≈ 270 МБ верхняя граница.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    image: supabase/postgres:15.8.1.085
+    container_name: aicms-db
+    restart: unless-stopped
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: ${POSTGRES_PORT}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      POSTGRES_DB: ${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: ${JWT_EXPIRY}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:ro
+      - ./volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:ro
+      - ./volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:ro
+      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
+      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
+    networks: [internal]
+
+  auth:
+    image: supabase/gotrue:v2.186.0
+    container_name: aicms-auth
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      GOTRUE_SITE_URL: ${SITE_URL}
+      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS}
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_ISSUER: ${API_EXTERNAL_URL}/auth/v1
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"        # SMTP отключён — регистрация через /admin/registration-requests
+      GOTRUE_SMTP_ADMIN_EMAIL: admin@platform.ru
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "true"
+      GOTRUE_SMS_AUTOCONFIRM: "true"
+    networks: [internal]
+
+  rest:
+    image: postgrest/postgrest:v14.8
+    container_name: aicms-rest
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      PGRST_DB_SCHEMAS: public,storage,graphql_public
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY}
+    command: [postgrest]
+    networks: [internal]
+
+  realtime:
+    image: supabase/realtime:v2.76.5
+    container_name: aicms-realtime
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 4000
+      DB_HOST: ${POSTGRES_HOST}
+      DB_PORT: ${POSTGRES_PORT}
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      DB_AFTER_CONNECT_QUERY: 'SET search_path TO _realtime'
+      DB_ENC_KEY: supabaserealtime
+      API_JWT_SECRET: ${JWT_SECRET}
+      METRICS_JWT_SECRET: ${JWT_SECRET}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: "10000"
+      APP_NAME: realtime
+      SEED_SELF_HOST: "true"
+      RUN_JANITOR: "true"
+      DISABLE_HEALTHCHECK_LOGGING: "true"
+    networks: [internal]
+
+  storage:
+    image: supabase/storage-api:v1.48.26
+    container_name: aicms-storage
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+    volumes:
+      - storage-data:/var/lib/storage
+    environment:
+      ANON_KEY: ${ANON_KEY}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      STORAGE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+      FILE_SIZE_LIMIT: 52428800
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: ${STORAGE_TENANT_ID}
+      REGION: ${REGION}
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET}
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+      S3_PROTOCOL_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID}
+      S3_PROTOCOL_ACCESS_KEY_SECRET: ${S3_PROTOCOL_ACCESS_KEY_SECRET}
+    networks: [internal]
+
+  kong:
+    image: kong/kong:3.9.1
+    container_name: aicms-kong
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - auth
+      - rest
+      - realtime
+      - storage
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+    volumes:
+      - ./volumes/api/kong.yml:/var/lib/kong/kong.yml:ro
+    networks: [internal]
+
+  studio:
+    # Built locally on the VPS: `docker compose build studio` pulls code from the repo
+    # (context: ..) and inlines NEXT_PUBLIC_* into the bundle via build-args.
+    build:
+      context: ..
+      dockerfile: apps/studio/Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${API_EXTERNAL_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+    image: ai-cms-studio:latest
+    container_name: aicms-studio
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - kong
+      - ollama
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      NEXT_PUBLIC_SUPABASE_URL: ${API_EXTERNAL_URL}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+      # Server-side reaches Supabase directly over the docker network (kong), not the
+      # public TLS domain — faster and independent of Caddy/DNS/cert state. The browser
+      # still uses NEXT_PUBLIC_SUPABASE_URL (Caddy → kong from outside).
+      SUPABASE_INTERNAL_URL: http://kong:8000
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_JWT_SECRET: ${JWT_SECRET}
+      # Self-hosted LLM inference (Ollama on the internal network).
+      LLM_BASE_URL: http://ollama:11434/v1
+      LLM_API_KEY: sk-no-key-required
+      LLM_MODEL: ${LLM_MODEL:-llama3.1:8b}
+      LLM_TEMPERATURE: "0.2"
+      # Voice input (optional) — point at the whisper service below if enabled.
+      STT_BASE_URL: ${STT_BASE_URL:-}
+      STT_MODEL: ${STT_MODEL:-Systran/faster-whisper-base}
+      STT_LANGUAGE: ${STT_LANGUAGE:-ru}
+      # Per-tenant git repos + published sites on a persistent volume.
+      TENANTS_ROOT: /data/tenants
+      SITES_ROOT: /data/sites
+      TEMPLATE_DIR: /app/templates/starter
+      # Subdomain/custom-domain routing (R5).
+      PLATFORM_BASE_DOMAIN: ${PLATFORM_BASE_DOMAIN:-platform.ru}
+      CUSTOM_DOMAIN_CNAME: ${CUSTOM_DOMAIN_CNAME:-}
+      PLATFORM_IP: ${PLATFORM_IP:-}
+    volumes:
+      - tenant-data:/data
+    networks: [internal]
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aicms-ollama
+    restart: unless-stopped
+    logging: *default-logging
+    # GPU (optional): uncomment for NVIDIA. CPU works out of the box (slower).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - { driver: nvidia, count: all, capabilities: [gpu] }
+    volumes:
+      - ollama-data:/root/.ollama
+    networks: [internal]
+
+  # Voice input (R3) — OPTIONAL. Uncomment + set STT_BASE_URL=http://whisper:8000/v1
+  # in infra/.env to enable the editor's mic button. OpenAI-compatible /audio/transcriptions.
+  # whisper:
+  #   image: fedirz/faster-whisper-server:latest-cpu
+  #   container_name: aicms-whisper
+  #   restart: unless-stopped
+  #   logging: *default-logging
+  #   environment:
+  #     WHISPER__MODEL: Systran/faster-whisper-base
+  #   volumes:
+  #     - whisper-data:/root/.cache/huggingface
+  #   networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: aicms-caddy
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # DNS provider token for wildcard TLS (DNS-01). See Caddyfile + infra/README.
+      DNS_API_TOKEN: ${DNS_API_TOKEN:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - kong
+      - studio
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  db-data:
+  storage-data:
+  caddy-data:
+  caddy-config:
+  tenant-data:
+  ollama-data:
+  # whisper-data:   # uncomment with the whisper service (R3)

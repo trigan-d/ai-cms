@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+.env
+.env.local
+.DS_Store
+
+# Local runtime data (per-tenant repos, published sites, scratch)
+/data/
+/.scratch/

@@ -1,0 +1,66 @@
+{
+  "description": "Phase-0 spike: real Siberian-Motorbears-style edit requests. Checks are intentionally lenient smoke signals; the diff is also printed for human review. 'manual' tasks are judged by a human from the diff.",
+  "tasks": [
+    {
+      "id": "dark-background",
+      "prompt": "Сделай фон сайта тёмным, а текст светлым.",
+      "expect": [
+        { "path": "css/styles.css", "regex": "--bg:\\s*#(0|1|2|3)[0-9a-f]{0,5}" }
+      ]
+    },
+    {
+      "id": "add-contacts-nav",
+      "prompt": "Добавь в меню пункт «Контакты».",
+      "expect": [{ "path": "index.html", "includesAny": ["Контакты", "Contacts"] }]
+    },
+    {
+      "id": "change-title",
+      "prompt": "Поменяй заголовок сайта (в шапке и в title) на «Пекарня Тёплый Хлеб».",
+      "expect": [
+        { "path": "index.html", "includesAny": ["Тёплый Хлеб", "Теплый Хлеб"] }
+      ]
+    },
+    {
+      "id": "hero-text",
+      "prompt": "Перепиши текст на главном экране: заголовок «Свежий хлеб каждый день», под ним короткое приветствие.",
+      "expect": [{ "path": "index.html", "includesAny": ["Свежий хлеб"] }]
+    },
+    {
+      "id": "primary-color-green",
+      "prompt": "Сделай основной цвет сайта (кнопки и ссылки при наведении) зелёным.",
+      "expect": [
+        { "path": "css/styles.css", "regex": "--primary:\\s*#[0-9a-f]{3,6}" }
+      ]
+    },
+    {
+      "id": "add-contacts-page",
+      "prompt": "Добавь отдельную страницу «Контакты» с адресом и телефоном, и ссылку на неё в меню.",
+      "expect": [
+        { "path": "contacts.html", "includesAny": ["Контакты", "телефон", "адрес"] },
+        { "path": "index.html", "includesAny": ["contacts.html", "Контакты"] }
+      ]
+    },
+    {
+      "id": "remove-third-service",
+      "prompt": "В разделе «Услуги» оставь только две карточки, третью убери.",
+      "manual": true
+    },
+    {
+      "id": "footer-year",
+      "prompt": "В подвале добавь к копирайту строку «Сделано с любовью».",
+      "expect": [{ "path": "index.html", "includesAny": ["с любовью"] }]
+    },
+    {
+      "id": "bigger-hero-font",
+      "prompt": "Увеличь шрифт большого заголовка на главном экране.",
+      "manual": true
+    },
+    {
+      "id": "add-faq-section",
+      "prompt": "Добавь на главную секцию «Частые вопросы» с двумя вопросами и ответами.",
+      "expect": [
+        { "path": "index.html", "includesAny": ["Частые вопросы", "вопрос"] }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,72 @@
+{
+    email admin@platform.ru
+    admin off
+    # Custom tenant domains (R5): on-demand TLS guarded by an ask endpoint so certs are
+    # only issued for verified domains the platform knows about.
+    on_demand_tls {
+        ask http://studio:3000/api/tls/allowed
+    }
+}
+
+# Apex + app host → the Studio dashboard/editor (auth-gated inside the app).
+platform.ru, app.platform.ru {
+    encode zstd gzip
+    reverse_proxy studio:3000 {
+        flush_interval -1
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}
+
+# Supabase API (GoTrue/PostgREST/Realtime) for the browser.
+api.platform.ru {
+    encode zstd gzip
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @websocket kong:8000
+    reverse_proxy kong:8000 {
+        flush_interval -1
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+}
+
+# Every tenant site lives on a 3rd-level subdomain. One WILDCARD cert (DNS-01) covers
+# them all, so provisioning a new tenant never touches DNS/Caddy/cert state. Studio's
+# proxy.ts resolves the subdomain and serves that tenant's published site.
+#
+# NOTE: wildcard certs require the DNS-01 challenge, which needs a Caddy image built
+# with your DNS provider plugin (xcaddy --with github.com/caddy-dns/<provider>). Swap
+# `cloudflare` for your provider and set DNS_API_TOKEN. See infra/README.md.
+*.platform.ru {
+    encode zstd gzip
+    tls {
+        dns cloudflare {env.DNS_API_TOKEN}
+        resolvers 1.1.1.1
+    }
+    reverse_proxy studio:3000 {
+        flush_interval -1
+    }
+}
+
+# Custom tenant domains (R5): any other HTTPS host. Cert issued on-demand, but ONLY
+# if /api/tls/allowed approves it (verified domain). Studio's proxy.ts resolves the
+# host → tenant and serves the published site.
+https:// {
+    encode zstd gzip
+    tls {
+        on_demand
+    }
+    reverse_proxy studio:3000 {
+        flush_interval -1
+    }
+}

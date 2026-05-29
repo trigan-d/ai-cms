@@ -1,0 +1,14 @@
+{
+  "name": "@ai-cms/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "chat": "tsx src/chat.ts",
+    "spike": "tsx src/spike.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ai-cms/agent-core": "workspace:*"
+  }
+}
